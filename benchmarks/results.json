@@ -1,0 +1,58 @@
+{
+  "fast_motion": {
+    "0.5x": {
+      "speed_factor": 0.5,
+      "confidence": 0.161,
+      "attention_peak": 0.022
+    },
+    "0.75x": {
+      "speed_factor": 0.75,
+      "confidence": 0.161,
+      "attention_peak": 0.022
+    },
+    "1.0x": {
+      "speed_factor": 1.0,
+      "confidence": 0.161,
+      "attention_peak": 0.022
+    },
+    "1.5x": {
+      "speed_factor": 1.5,
+      "confidence": 0.161,
+      "attention_peak": 0.022
+    },
+    "2.0x": {
+      "speed_factor": 2.0,
+      "confidence": 0.161,
+      "attention_peak": 0.022
+    }
+  },
+  "latency": {
+    "clahe_ms": 1.73,
+    "kalman_ms": 0.7,
+    "features_ms": 0.07,
+    "neural_net_ms": 2.98,
+    "total_ms": 5.48,
+    "estimated_fps": 182.3,
+    "target_met": true
+  },
+  "lighting": {
+    "dark": {
+      "raw_contrast_std": 1.85,
+      "enhanced_contrast_std": 2.6,
+      "contrast_gain_pct": 40.0,
+      "mean_lightness": 59.6
+    },
+    "normal": {
+      "raw_contrast_std": 6.26,
+      "enhanced_contrast_std": 5.6,
+      "contrast_gain_pct": -10.5,
+      "mean_lightness": 144.95
+    },
+    "glare": {
+      "raw_contrast_std": 0.0,
+      "enhanced_contrast_std": 0.0,
+      "contrast_gain_pct": 0.0,
+      "mean_lightness": 235.0
+    }
+  }
+}
