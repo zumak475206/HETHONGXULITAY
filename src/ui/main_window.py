@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QIcon, QFont, QColor
+from PyQt6.QtGui import QIcon, QFont, QColor, QPainter, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -51,6 +51,79 @@ from src.ui.theme import (
 )
 
 
+class CameraViewport(QLabel):
+    """
+    Khung hiển thị Camera chuyên dụng chống co giật (Anti-Jitter / Anti-Flicker Viewport).
+    - QSizePolicy.Policy.Ignored triệt tiêu hoàn toàn vòng lặp layout recursion.
+    - Vẽ trực tiếp qua paintEvent và tự căn tỷ lệ KeepAspectRatio ở chính giữa khung hình.
+    - Cố định khung hình ổn định, không làm giật hay co giãn layout khi camera cập nhật 60 FPS.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background-color: transparent;")
+        self.setMinimumSize(320, 240)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self._current_pixmap: Optional[QPixmap] = None
+        self._placeholder_text: str = (
+            "📷 Đang kết nối Camera...\n"
+            "Kiểm tra webcam đã được cắm vào chưa.\n\n"
+            "Nếu không có camera, hệ thống sẽ chạy ở chế độ Simulation."
+        )
+
+    def setPixmap(self, pixmap: Optional[QPixmap]) -> None:
+        """Lưu pixmap và kích hoạt vẽ lại mà KHÔNG gọi updateGeometry() làm giật layout."""
+        self._current_pixmap = pixmap
+        if pixmap and not pixmap.isNull():
+            self._placeholder_text = ""
+        self.update()
+
+    def pixmap(self) -> Optional[QPixmap]:
+        """Trả về pixmap hiện tại cho PiP widget và unit tests."""
+        return self._current_pixmap
+
+    def setText(self, text: str) -> None:
+        """Đặt text placeholder khi chưa có frame."""
+        self._placeholder_text = text
+        self.update()
+
+    def text(self) -> str:
+        """Trả về text placeholder hiện tại."""
+        return self._placeholder_text
+
+    def clear(self) -> None:
+        """Xóa frame và text."""
+        self._current_pixmap = None
+        self._placeholder_text = ""
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        """Vẽ khung hình camera căn giữa tỷ lệ chuẩn, hoàn toàn độc lập với Qt layout."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        w = self.width()
+        h = self.height()
+
+        if self._current_pixmap and not self._current_pixmap.isNull():
+            pm_w = self._current_pixmap.width()
+            pm_h = self._current_pixmap.height()
+            if pm_w > 0 and pm_h > 0:
+                scale = min(w / pm_w, h / pm_h)
+                draw_w = max(1, int(pm_w * scale))
+                draw_h = max(1, int(pm_h * scale))
+                x = (w - draw_w) // 2
+                y = (h - draw_h) // 2
+                painter.drawPixmap(x, y, draw_w, draw_h, self._current_pixmap)
+        elif self._placeholder_text:
+            painter.setPen(QColor(148, 163, 184))
+            font = painter.font()
+            font.setPointSize(11)
+            painter.setFont(font)
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder_text)
+
+
 class MainWindow(QMainWindow):
     """Cửa sổ ứng dụng Desktop quản trị HETHONGXULITAY."""
 
@@ -63,8 +136,9 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1240, 780)
         self.resize(1320, 840)
 
-        # Trạng thái hiện tại của ứng dụng
-        self.current_mode_name = self.db.get_setting("current_mode", "MODE1_MOUSE")
+        # Trạng thái hiện tại của ứng dụng — khởi động ở STANDBY (không mode nào)
+        self.current_mode_name = "STANDBY"
+        self.db.set_setting("current_mode", "STANDBY")
         self.active_author = self.db.get_setting("active_author", "Tôi")
         self.is_paused = False
 
@@ -78,12 +152,14 @@ class MainWindow(QMainWindow):
         # Nạp dữ liệu ban đầu
         self.refresh_stats()
 
-        # Khởi tạo CameraWorker xử lý nền
-        self.camera_worker = CameraWorker(initial_mode=self.current_mode_name, parent=self)
+        # Khởi tạo CameraWorker xử lý nền — bắt đầu ở STANDBY
+        self.camera_worker = CameraWorker(initial_mode="STANDBY", parent=self)
         self.camera_worker.frame_ready.connect(self._on_worker_frame_ready)
         self.camera_worker.metrics_ready.connect(self._on_worker_metrics_ready)
         self.camera_worker.mode_switched.connect(self._on_worker_mode_switched)
         self.camera_worker.error_occurred.connect(self._on_worker_error)
+        self.camera_worker.show_mode_menu.connect(self._on_show_mode_menu)
+        self.camera_worker.quit_app.connect(self.close)
 
         if self.start_camera:
             self.camera_worker.start()
@@ -273,36 +349,30 @@ class MainWindow(QMainWindow):
         center_row = QHBoxLayout()
         center_row.setSpacing(16)
 
-        # Canvas Camera (Placeholder cho CP9)
+        # Canvas Camera (Khung cố định ổn định, không co giật)
         self.camera_canvas = QFrame()
         self.camera_canvas.setObjectName("CameraCanvasFrame")
+        self.camera_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.camera_canvas.setStyleSheet("""
             background-color: #050811;
             border: 2px dashed #1e293b;
             border-radius: 12px;
         """)
         canvas_layout = QVBoxLayout(self.camera_canvas)
-        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setContentsMargins(4, 4, 4, 4)
         canvas_layout.setSpacing(0)
 
-        self.lbl_cam_preview = QLabel()
-        self.lbl_cam_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_cam_preview.setStyleSheet("background-color: transparent;")
-        self.lbl_cam_preview.setMinimumSize(320, 240)
-        self.lbl_cam_preview.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Expanding,
-        )
-        # Placeholder text trước khi camera kết nối
-        self._show_camera_placeholder()
+        # Sử dụng CameraViewport chống co giật (Anti-Jitter Viewport)
+        self.lbl_cam_preview = CameraViewport(self.camera_canvas)
         canvas_layout.addWidget(self.lbl_cam_preview)
 
-        center_row.addWidget(self.camera_canvas, stretch=7)
+        center_row.addWidget(self.camera_canvas, stretch=1)
 
-        # Bảng thông số đo đạc nhanh bên phải (Side HUD Card)
+        # Bảng thông số đo đạc nhanh bên phải (Side HUD Card) - Cố định chiều rộng 310px
         side_card = QFrame()
         side_card.setProperty("class", "CardFrame")
-        side_card.setStyleSheet(f"background-color: #11192b; border: 1px solid #1e293b; border-radius: 12px; max-width: 320px;")
+        side_card.setFixedWidth(310)
+        side_card.setStyleSheet("background-color: #11192b; border: 1px solid #1e293b; border-radius: 12px;")
         side_layout = QVBoxLayout(side_card)
         side_layout.setContentsMargins(16, 16, 16, 16)
         side_layout.setSpacing(12)
@@ -311,7 +381,7 @@ class MainWindow(QMainWindow):
         lbl_side_title.setStyleSheet(f"color: {COLOR_CYAN}; font-size: 13px; font-weight: 700;")
         side_layout.addWidget(lbl_side_title)
 
-        # Các chỉ số
+        # Các chỉ số (cho phép xuống dòng tự động, không đẩy méo giao diện)
         self.lbl_hud_fps = QLabel("Tốc độ khung hình: 60.0 FPS")
         self.lbl_hud_action = QLabel("Hành động: Di chuot (0ms)")
         self.lbl_hud_pipeline = QLabel("Đường truyền: Dual-Pipeline (Raw + OneEuro)")
@@ -319,6 +389,7 @@ class MainWindow(QMainWindow):
 
         for lbl in [self.lbl_hud_fps, self.lbl_hud_action, self.lbl_hud_pipeline, self.lbl_hud_guard]:
             lbl.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 12px; padding: 4px 0px;")
+            lbl.setWordWrap(True)
             side_layout.addWidget(lbl)
 
         side_layout.addStretch()
@@ -330,7 +401,7 @@ class MainWindow(QMainWindow):
         self.btn_pip.clicked.connect(self._toggle_pip)
         side_layout.addWidget(self.btn_pip)
 
-        center_row.addWidget(side_card, stretch=3)
+        center_row.addWidget(side_card, stretch=0)
         layout.addLayout(center_row, stretch=1)
 
         # Dải nút chọn Mode nhỏ bên dưới Camera (Mode Strip)
@@ -369,7 +440,7 @@ class MainWindow(QMainWindow):
         strip_layout.addWidget(self.btn_standby)
 
         strip_layout.addStretch()
-        lbl_guide = QLabel("Mẹo: Xòe 2 tay 2s để mở Menu không chạm")
+        lbl_guide = QLabel("Mẹo: Xòe 2 tay 1.5s → Menu | Nắm 1 tay → Khoá | Nắm 2 tay → Menu")
         lbl_guide.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; font-style: italic;")
         strip_layout.addWidget(lbl_guide)
 
@@ -541,6 +612,27 @@ class MainWindow(QMainWindow):
                 self.pip_widget.set_mode_badge("TẠM KHÓA", COLOR_ROSE)
             return
 
+        # STANDBY — chưa chọn mode
+        if self.current_mode_name == "STANDBY":
+            self.lbl_mode_badge.setText("⏳ STANDBY — Xòe 2 tay để bắt đầu")
+            self.lbl_mode_badge.setStyleSheet(f"""
+                background-color: rgba(0, 220, 255, 0.12);
+                color: {COLOR_CYAN};
+                border: 1px solid {COLOR_CYAN};
+                border-radius: 12px;
+                padding: 4px 12px;
+                font-size: 11px;
+                font-weight: 700;
+            """)
+            self.btn_standby.setText("⏸ TẠM KHÓA (STANDBY)")
+            for btn in self.mode_buttons.values():
+                btn.setProperty("active", "false")
+                btn.style().unpolish(btn)
+                btn.style().polish(btn)
+            if hasattr(self, "pip_widget") and self.pip_widget:
+                self.pip_widget.set_mode_badge("STANDBY", COLOR_CYAN)
+            return
+
         self.btn_standby.setText("⏸ TẠM KHÓA (STANDBY)")
         mode_titles = {
             "MODE1_MOUSE": "MODE 1: CHUỘT (0ms)",
@@ -593,19 +685,8 @@ class MainWindow(QMainWindow):
             q_img = QImage(rgb_frame.tobytes(), w, h, bytes_per_line, QImage.Format.Format_RGB888)
             pixmap = QPixmap.fromImage(q_img)
 
-            target_w = max(100, self.camera_canvas.width() - 4)
-            target_h = max(100, self.camera_canvas.height() - 4)
-            scaled = pixmap.scaled(
-                target_w,
-                target_h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-            # Xóa text placeholder khi nhận được frame đầu tiên
-            if self.lbl_cam_preview.text():
-                self.lbl_cam_preview.setText("")
-                self.lbl_cam_preview.setStyleSheet("background-color: transparent;")
-            self.lbl_cam_preview.setPixmap(scaled)
+            # Truyền trực tiếp pixmap vào CameraViewport, paintEvent tự động căn chỉnh và scale mượt mà
+            self.lbl_cam_preview.setPixmap(pixmap)
         except Exception:
             pass
 
@@ -687,10 +768,27 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"{action} | {fps:.1f} FPS")
 
     def _on_worker_mode_switched(self, new_mode: str) -> None:
-        """Xử lý khi người dùng đổi chế độ bằng cử chỉ tay (2 tay mở)."""
+        """Xử lý khi người dùng đổi chế độ bằng cử chỉ tay."""
         self.current_mode_name = new_mode
-        self.db.set_setting("current_mode", new_mode)
+        if new_mode not in ("STANDBY",):
+            self.db.set_setting("current_mode", new_mode)
+        self.is_paused = False
         self._update_mode_strip_ui()
+
+    def _on_show_mode_menu(self) -> None:
+        """Hiển thị thông báo menu chọn mode trên header khi gesture kích hoạt."""
+        self.current_mode_name = "STANDBY"
+        self.is_paused = False
+        self.lbl_mode_badge.setText("📋 MENU — Giơ ngón tay để chọn")
+        self.lbl_mode_badge.setStyleSheet(f"""
+            background-color: rgba(99, 102, 241, 0.20);
+            color: #818cf8;
+            border: 1px solid #818cf8;
+            border-radius: 12px;
+            padding: 4px 12px;
+            font-size: 11px;
+            font-weight: 700;
+        """)
 
     def _on_worker_error(self, err_msg: str) -> None:
         """Ghi nhận lỗi từ luồng camera."""

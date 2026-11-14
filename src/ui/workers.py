@@ -65,6 +65,15 @@ class CameraWorker(QThread):
     """
     Luồng nền xử lý thị giác máy tính, bóc tách cử chỉ và điều khiển chuột.
     Giao tiếp với giao diện chính qua PyQt Signals an toàn và không gây lag.
+
+    State Machine an toàn:
+      STANDBY  --(2 tay mở 1.5s)--> MENU_OPEN
+      MENU_OPEN --(1 ngón 1.5s)---> MODE1_MOUSE
+      MENU_OPEN --(2 ngón 1.5s)---> MODE2_GESTURES
+      MENU_OPEN --(3 ngón 1.5s)---> MODE3_SIGN
+      MENU_OPEN --(4 ngón 1.5s)---> QUIT
+      MODE_ANY  --(2 nắm 1.5s)----> MENU_OPEN
+      MODE_ANY  --(1 nắm 1.5s)----> STANDBY (khoá màn hình)
     """
 
     frame_ready = pyqtSignal(np.ndarray)
@@ -72,10 +81,17 @@ class CameraWorker(QThread):
     mode_switched = pyqtSignal(str)                           # new_mode_name
     feature_ready = pyqtSignal(list)                          # 158D feature vector cho Studio thu thập mẫu
     error_occurred = pyqtSignal(str)
+    show_mode_menu = pyqtSignal()                             # Yêu cầu UI hiển thị overlay menu chọn mode
+    quit_app = pyqtSignal()                                   # Yêu cầu thoát toàn bộ ứng dụng
 
-    def __init__(self, initial_mode: str = "MODE1_MOUSE", parent=None):
+    # Hằng thời gian giữ cử chỉ (giây)
+    GESTURE_HOLD_SEC: float = 1.5
+
+    def __init__(self, initial_mode: str = "STANDBY", parent=None):
         super().__init__(parent)
-        self.current_mode = initial_mode
+        # App-level state machine: STANDBY | MENU_OPEN | MODE1_MOUSE | MODE2_GESTURES | MODE3_SIGN
+        self.app_state: str = "STANDBY"
+        self.current_mode = "STANDBY"   # backward-compat alias
         self.is_paused = False
         self.mouse_paused = False
         self.recording_mode_id: Optional[int] = None
@@ -84,13 +100,20 @@ class CameraWorker(QThread):
         # Trạng thái tham số động
         self.mouse_controller: Optional[MouseController] = None
         self.enhancer: Optional[CLAHEEnhancer] = None
-        self.two_hand_switch_time: float = 2.0
+        self.two_hand_switch_time: float = 1.5  # kept for compat, state-machine uses GESTURE_HOLD_SEC
 
         # Hàng đợi điều phối hành động OS
         self.action_queue = queue.Queue(maxsize=15)
         self.dispatcher = ActionDispatcher(self.action_queue)
 
-        # Cờ chuyển mode bằng cử chỉ (2 bàn tay mở)
+        # ── State-machine hold timer ──────────────────────────────────────────
+        # gesture_hold_key: chuỗi mô tả cử chỉ đang được theo dõi
+        # gesture_hold_start: thời điểm bắt đầu giữ cử chỉ (0 = chưa bắt đầu)
+        self._gesture_hold_key: str = ""
+        self._gesture_hold_start: float = 0.0
+        self._gesture_cooldown: float = 0.0   # chống trigger liên tục
+
+        # Cờ chuyển mode cũ (kept cho backward-compat, không dùng logic này nữa)
         self.open_hands_start_time = 0.0
         self.open_hands_cooldown = 0.0
 
@@ -98,6 +121,56 @@ class CameraWorker(QThread):
         self.temporal_buffer = collections.deque(maxlen=config.SEQUENCE_LENGTH)
         for _ in range(config.SEQUENCE_LENGTH):
             self.temporal_buffer.append([0.0] * config.FEATURE_DIM)
+
+    # ── HELPER: đếm ngón tay duỗi ra ─────────────────────────────────────────
+
+    @staticmethod
+    def count_extended_fingers(hand_pts: list) -> int:
+        """
+        Trả về số ngón tay đang duỗi thẳng (0-5).
+        hand_pts: list các tuple (idx, x, y, z) từ MediaPipe Hands (21 điểm).
+        """
+        if not hand_pts or len(hand_pts) < 21:
+            return 0
+
+        # Chuyển thành dict {idx: (x, y, z)}
+        lm: Dict[int, tuple] = {p[0]: (p[1], p[2], p[3]) for p in hand_pts}
+
+        # TIP và PIP indices cho 4 ngón (index → pinky)
+        # Ngón duỗi khi TIP.y < PIP.y (y tăng xuống trong toạ độ chuẩn hoá)
+        finger_pairs = [
+            (8, 6),    # Index: TIP=8, PIP=6
+            (12, 10),  # Middle: TIP=12, PIP=10
+            (16, 14),  # Ring: TIP=16, PIP=14
+            (20, 18),  # Pinky: TIP=20, PIP=18
+        ]
+        count = sum(
+            1 for tip_i, pip_i in finger_pairs
+            if lm[tip_i][1] < lm[pip_i][1]
+        )
+
+        # Ngón cái: so sánh theo trục x (cần biết bàn tay trái/phải)
+        # Heuristic đơn giản: nếu wrist.x < middle_mcp.x → tay phải, ngược lại tay trái
+        wrist_x = lm[0][0]
+        mid_mcp_x = lm[9][0]
+        if wrist_x < mid_mcp_x:  # bàn tay phải (nhìn từ camera)
+            if lm[4][0] < lm[3][0]:
+                count += 1
+        else:                     # bàn tay trái
+            if lm[4][0] > lm[3][0]:
+                count += 1
+
+        return min(5, count)
+
+    @staticmethod
+    def is_hand_open(hand_pts: list) -> bool:
+        """Bàn tay xòe mở: >= 4 ngón duỗi."""
+        return CameraWorker.count_extended_fingers(hand_pts) >= 4
+
+    @staticmethod
+    def is_hand_fisted(hand_pts: list) -> bool:
+        """Bàn tay nắm lại: <= 1 ngón duỗi."""
+        return CameraWorker.count_extended_fingers(hand_pts) <= 1
 
     def update_mouse_settings(
         self,
@@ -130,16 +203,28 @@ class CameraWorker(QThread):
 
     def set_mode(self, mode_name: str) -> None:
         """Thay đổi chế độ hoạt động an toàn từ giao diện người dùng."""
-        if mode_name in ["MODE1_MOUSE", "MODE2_GESTURES", "MODE3_SIGN"]:
+        valid = ["STANDBY", "MODE1_MOUSE", "MODE2_GESTURES", "MODE3_SIGN"]
+        if mode_name in valid:
+            self.app_state = mode_name
             self.current_mode = mode_name
             # Reset buffer khi đổi chế độ
             self.temporal_buffer.clear()
             for _ in range(config.SEQUENCE_LENGTH):
                 self.temporal_buffer.append([0.0] * config.FEATURE_DIM)
+            self._reset_gesture_timer()
 
     def set_paused(self, paused: bool) -> None:
         """Bật / Tắt trạng thái tạm khóa (Standby Clutch)."""
         self.is_paused = paused
+        if paused:
+            self.app_state = "STANDBY"
+            self.current_mode = "STANDBY"
+        self._reset_gesture_timer()
+
+    def _reset_gesture_timer(self) -> None:
+        """Reset bộ đếm thời gian giữ cử chỉ."""
+        self._gesture_hold_key = ""
+        self._gesture_hold_start = 0.0
 
     def set_mouse_paused(self, paused: bool) -> None:
         """Tạm dừng điều khiển chuột OS (dành cho Studio, Training, Recording) mà không dừng Camera."""
@@ -160,6 +245,160 @@ class CameraWorker(QThread):
         self.wait(1500)
         if hasattr(self, "dispatcher") and self.dispatcher:
             self.dispatcher.stop()
+
+    def _update_gesture_state_machine(
+        self,
+        raw_hands_data: list,
+        frame: np.ndarray,
+        now: float,
+    ) -> None:
+        """
+        State machine cử chỉ an toàn — gọi mỗi frame.
+        Phát signal lên UI khi cần chuyển trạng thái.
+        """
+        h, w = frame.shape[:2]
+        cx = w // 2
+
+        # ── Xác định gesture hiện tại ─────────────────────────────────────────
+        n_hands = len(raw_hands_data)
+        gesture_key = ""
+
+        if self.app_state == "STANDBY":
+            # Kích hoạt menu: 2 tay xòe mở
+            if n_hands == 2:
+                open0 = self.is_hand_open(raw_hands_data[0])
+                open1 = self.is_hand_open(raw_hands_data[1])
+                if open0 and open1:
+                    gesture_key = "BOTH_OPEN"
+
+        elif self.app_state == "MENU_OPEN":
+            # Chọn mode bằng số ngón tay (1/2/3/4) — chỉ cần 1 tay
+            if n_hands >= 1:
+                # Lấy số ngón của bàn tay có ngón nhiều nhất để ổn định hơn
+                fingers = max(self.count_extended_fingers(h_pts) for h_pts in raw_hands_data)
+                if fingers in (1, 2, 3, 4):
+                    gesture_key = f"FINGERS_{fingers}"
+
+        else:
+            # Đang ở một mode nào đó (MODE1/2/3)
+            if n_hands == 2:
+                fist0 = self.is_hand_fisted(raw_hands_data[0])
+                fist1 = self.is_hand_fisted(raw_hands_data[1])
+                if fist0 and fist1:
+                    gesture_key = "BOTH_FIST"  # → về menu
+            elif n_hands == 1:
+                if self.is_hand_fisted(raw_hands_data[0]):
+                    gesture_key = "ONE_FIST"   # → khóa màn hình / standby
+
+        # ── Bộ đếm thời gian giữ ─────────────────────────────────────────────
+        if gesture_key:
+            if gesture_key != self._gesture_hold_key:
+                # Cử chỉ mới — reset timer
+                self._gesture_hold_key = gesture_key
+                self._gesture_hold_start = now
+            else:
+                duration = now - self._gesture_hold_start
+                progress = min(1.0, duration / self.GESTURE_HOLD_SEC)
+                self._draw_hold_progress(frame, cx, progress, gesture_key)
+
+                if duration >= self.GESTURE_HOLD_SEC:
+                    self._trigger_gesture(gesture_key, now)
+        else:
+            # Không có cử chỉ khớp — reset
+            self._gesture_hold_key = ""
+            self._gesture_hold_start = 0.0
+
+    def _draw_hold_progress(
+        self,
+        frame: np.ndarray,
+        cx: int,
+        progress: float,
+        key: str,
+    ) -> None:
+        """Vẽ vòng cung tiến trình trên frame để người dùng biết cử chỉ đang được nhận."""
+        h = frame.shape[0]
+        center = (cx, 55)
+        radius = 32
+        angle = int(360 * progress)
+        bar_color = {
+            "BOTH_OPEN": (0, 220, 255),   # cyan  → mở menu
+            "FINGERS_1": (16, 185, 129),  # green → mode 1
+            "FINGERS_2": (251, 191, 36),  # amber → mode 2
+            "FINGERS_3": (99, 102, 241),  # indigo → mode 3
+            "FINGERS_4": (244, 63, 94),   # rose  → thoát
+            "BOTH_FIST": (251, 191, 36),  # amber → về menu
+            "ONE_FIST":  (244, 63, 94),   # rose  → khóa
+        }.get(key, (200, 200, 200))
+
+        label_map = {
+            "BOTH_OPEN": "MO MENU...",
+            "FINGERS_1": "MODE 1 CHUOT...",
+            "FINGERS_2": "MODE 2 SLIDES...",
+            "FINGERS_3": "MODE 3 KY HIEU...",
+            "FINGERS_4": "THOAT APP...",
+            "BOTH_FIST": "VE MENU...",
+            "ONE_FIST":  "KHOA MAN HINH...",
+        }
+        label = label_map.get(key, key)
+
+        # Nền tối cho vòng cung
+        cv2.circle(frame, center, radius + 4, (12, 18, 35), cv2.FILLED)
+        # Vòng nền
+        cv2.circle(frame, center, radius, (40, 50, 70), 4)
+        # Vòng cung tiến trình
+        cv2.ellipse(frame, center, (radius, radius), -90, 0, angle,
+                    bar_color, 4, cv2.LINE_AA)
+        # Phần trăm bên trong
+        pct_text = f"{int(progress * 100)}%"
+        cv2.putText(frame, pct_text, (center[0] - 16, center[1] + 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        # Nhãn bên dưới vòng
+        cv2.putText(frame, label, (cx - len(label) * 4, 105),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, bar_color, 1)
+
+    def _trigger_gesture(self, gesture_key: str, now: float) -> None:
+        """Thực thi chuyển trạng thái sau khi giữ đủ thời gian."""
+        self._gesture_hold_key = ""
+        self._gesture_hold_start = 0.0
+        self._gesture_cooldown = now + 2.0  # cooldown 2s
+
+        if gesture_key == "BOTH_OPEN" and self.app_state == "STANDBY":
+            self.app_state = "MENU_OPEN"
+            self.current_mode = "STANDBY"
+            self.show_mode_menu.emit()
+
+        elif gesture_key == "FINGERS_1" and self.app_state == "MENU_OPEN":
+            self._enter_mode("MODE1_MOUSE")
+
+        elif gesture_key == "FINGERS_2" and self.app_state == "MENU_OPEN":
+            self._enter_mode("MODE2_GESTURES")
+
+        elif gesture_key == "FINGERS_3" and self.app_state == "MENU_OPEN":
+            self._enter_mode("MODE3_SIGN")
+
+        elif gesture_key == "FINGERS_4" and self.app_state == "MENU_OPEN":
+            self.quit_app.emit()
+
+        elif gesture_key == "BOTH_FIST" and self.app_state not in ("STANDBY", "MENU_OPEN"):
+            self.app_state = "MENU_OPEN"
+            self.current_mode = "STANDBY"
+            self.show_mode_menu.emit()
+
+        elif gesture_key == "ONE_FIST" and self.app_state not in ("STANDBY", "MENU_OPEN"):
+            self.app_state = "STANDBY"
+            self.current_mode = "STANDBY"
+            self.is_paused = False          # camera vẫn chạy nhưng mode tắt
+            self.mode_switched.emit("STANDBY")
+
+    def _enter_mode(self, mode_name: str) -> None:
+        """Chuyển vào mode cụ thể từ menu."""
+        self.app_state = mode_name
+        self.current_mode = mode_name
+        self.is_paused = False
+        self.temporal_buffer.clear()
+        for _ in range(config.SEQUENCE_LENGTH):
+            self.temporal_buffer.append([0.0] * config.FEATURE_DIM)
+        self.mode_switched.emit(mode_name)
 
     def run(self) -> None:
         """Vòng lặp chính xử lý thị giác máy tính 60 FPS."""
@@ -351,45 +590,16 @@ class CameraWorker(QThread):
                         hands_data.append(smoothed_pts)
                         velocities.append(kalman_hands[h_idx].get_hand_velocity())
 
-            # ── NHẬN DIỆN CỬ CHỈ CHUYỂN MODE TỰ ĐỘNG (2 TAY MỞ TRONG 1.8S) ──
+            # ── STATE MACHINE CỬ CHỈ AN TOÀN ────────────────────────────────
             now = time.time()
-            if not getattr(self, "mouse_paused", False) and len(raw_hands_data) == 2 and now > self.open_hands_cooldown:
-                f_up0 = mouse_controller.count_fingers_up(raw_hands_data[0])
-                f_up1 = mouse_controller.count_fingers_up(raw_hands_data[1])
-                # Cả 2 bàn tay đều xòe trọn vẹn 5 ngón (10 ngón duỗi)
-                if sum(f_up0) == 5 and sum(f_up1) == 5:
-                    if self.open_hands_start_time == 0.0:
-                        self.open_hands_start_time = now
-                    duration = now - self.open_hands_start_time
-                    hold_req = float(getattr(self, "two_hand_switch_time", 2.0))
-                    progress = min(1.0, duration / max(0.5, hold_req))
-
-                    # Vẽ thanh tiến trình chuyển Mode phát sáng trên frame
-                    bar_w = int(320 * progress)
-                    cv2.rectangle(enhanced, (w // 2 - 160, 40), (w // 2 + 160, 70), (15, 23, 42), cv2.FILLED)
-                    cv2.rectangle(enhanced, (w // 2 - 160, 40), (w // 2 - 160 + bar_w, 70), (0, 220, 255), cv2.FILLED)
-                    cv2.rectangle(enhanced, (w // 2 - 160, 40), (w // 2 + 160, 70), (0, 220, 255), 2)
-                    cv2.putText(enhanced, f"CHUYEN MODE ({int(progress*100)}%) - GIU 2 TAY MO",
-                                (w // 2 - 145, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1)
-
-                    if duration >= hold_req:
-                        # Chuyển tuần tự giữa 3 Mode
-                        mode_cycle = ["MODE1_MOUSE", "MODE2_GESTURES", "MODE3_SIGN"]
-                        cur_idx = mode_cycle.index(self.current_mode) if self.current_mode in mode_cycle else 0
-                        next_mode = mode_cycle[(cur_idx + 1) % len(mode_cycle)]
-                        self.set_mode(next_mode)
-                        self.open_hands_start_time = 0.0
-                        self.open_hands_cooldown = now + 2.0  # Cooldown 2s chống đổi liên tục
-                        self.mode_switched.emit(next_mode)
-                else:
-                    self.open_hands_start_time = 0.0
-            else:
-                self.open_hands_start_time = 0.0
+            if not getattr(self, "mouse_paused", False) and now > self._gesture_cooldown:
+                self._update_gesture_state_machine(raw_hands_data, enhanced, now)
 
             # ── DUAL-PIPELINE: XỬ LÝ THEO CHẾ ĐỘ HIỆN TẠI ──
-            action_text = "Chờ cử chỉ"
+            action_text = "Cho cu chi"
             pipeline_text = "Dual-Pipeline"
 
+            # Luôn trích đặc trưng 158D (phục vụ Studio/recording)
             rec_mode = getattr(self, "recording_mode_id", None)
             if rec_mode is not None:
                 mode_val = int(rec_mode)
@@ -399,7 +609,43 @@ class CameraWorker(QThread):
             self.temporal_buffer.append(feat_158d)
             self.feature_ready.emit(feat_158d)
 
-            if self.current_mode == "MODE1_MOUSE":
+            # Khi STANDBY hoặc MENU_OPEN: hiển thị overlay hướng dẫn, không chạy mode nào
+            if self.app_state in ("STANDBY", "MENU_OPEN"):
+                if self.app_state == "STANDBY":
+                    pipeline_text = "STANDBY - Cho cu chi"
+                    action_text = "XOE 2 TAY 1.5s de mo Menu"
+                    # Vẽ overlay STANDBY trên frame
+                    overlay = enhanced.copy()
+                    cv2.rectangle(overlay, (0, 0), (w, h), (5, 10, 22), -1)
+                    cv2.addWeighted(overlay, 0.55, enhanced, 0.45, 0, enhanced)
+                    cv2.putText(enhanced, "STANDBY - CHO CU CHI", (w // 2 - 160, h // 2 - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 220, 255), 2, cv2.LINE_AA)
+                    cv2.putText(enhanced, "XOE 2 TAY 1.5s -> MENU CHON MODE",
+                                (w // 2 - 215, h // 2 + 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (160, 160, 160), 1)
+                else:
+                    pipeline_text = "MENU - Chon Mode"
+                    action_text = "Giu so ngon: 1=Mode1 2=Mode2 3=Mode3 4=Thoat"
+                    # Vẽ overlay MENU trên frame
+                    overlay = enhanced.copy()
+                    cv2.rectangle(overlay, (0, 0), (w, h), (5, 10, 22), -1)
+                    cv2.addWeighted(overlay, 0.50, enhanced, 0.50, 0, enhanced)
+                    cv2.putText(enhanced, "MENU CHON MODE", (w // 2 - 110, h // 2 - 70),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 255), 2, cv2.LINE_AA)
+                    items = [
+                        (" 1 ngon → MODE 1: CHUOT", (16, 185, 129)),
+                        (" 2 ngon → MODE 2: SLIDES", (251, 191, 36)),
+                        (" 3 ngon → MODE 3: KY HIEU", (99, 102, 241)),
+                        (" 4 ngon → THOAT APP", (244, 63, 94)),
+                    ]
+                    for i, (txt, col) in enumerate(items):
+                        cv2.putText(enhanced, txt, (w // 2 - 160, h // 2 - 20 + i * 36),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.60, col, 1, cv2.LINE_AA)
+                    cv2.putText(enhanced, "Giu cu chi 1.5s de xac nhan",
+                                (w // 2 - 165, h // 2 + 140),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (120, 120, 120), 1)
+
+            elif self.current_mode == "MODE1_MOUSE":
                 if not getattr(self, "mouse_paused", False):
                     # Mode 1: Chuột tức thì Zero-Lag (0ms)
                     pipeline_text = "Zero-Lag (Raw + OneEuro)"
