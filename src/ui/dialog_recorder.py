@@ -526,6 +526,14 @@ class RecordingDialog(QDialog):
             self.progress_bar.setValue(0)
             return
 
+        # Kiểm tra sự hiện diện của bàn tay
+        valid_hand_frames = sum(1 for f in self._record_buffer if np.count_nonzero(f[:157]) > 0)
+        if valid_hand_frames < 10 and self.gesture_name != "IDLE":
+            self.lbl_status.setText(f"⚠️ Bàn tay không xuất hiện đủ rõ (chỉ có {valid_hand_frames} frames). Vui lòng giơ tay rõ trước camera và quay lại!")
+            self.lbl_status.setStyleSheet(f"color: {COLOR_AMBER}; font-size: 12px; font-weight: 700;")
+            self.progress_bar.setValue(0)
+            return
+
         # Nắn chuẩn thời gian (Temporal Resampling) về 45 frames x 158D
         raw_arr = np.array(self._record_buffer, dtype=np.float32)
         resampled_arr = resample_sequence(raw_arr, target_seq_len=45)

@@ -35,6 +35,7 @@ import config
 from src.database.db_manager import DatabaseManager
 from src.database.dataset_merger import load_merged_dataset
 from src.ui.pip_widget import PiPWidget
+from src.ui.subtitle_overlay import DesktopSubtitleOverlay
 from src.ui.workers import CameraWorker, TrainWorker
 from src.ui.tab_library import LibraryPage
 from src.ui.tab_studio import StudioPage
@@ -146,6 +147,10 @@ class MainWindow(QMainWindow):
         self.pip_widget = PiPWidget()
         self.pip_widget.restore_requested.connect(self._restore_from_pip)
 
+        # Khởi tạo Cửa sổ Phụ Đề Nổi Toàn Màn Hình Máy Tính (Global Desktop Subtitle Overlay)
+        self.subtitle_overlay = DesktopSubtitleOverlay(parent=None)
+        self.subtitle_overlay.clear_requested.connect(self._on_subtitle_clear_requested)
+
         self._init_ui()
         self.apply_theme()
 
@@ -153,10 +158,11 @@ class MainWindow(QMainWindow):
         self.refresh_stats()
 
         # Khởi tạo CameraWorker xử lý nền — bắt đầu ở STANDBY
-        self.camera_worker = CameraWorker(initial_mode="STANDBY", parent=self)
+        self.camera_worker = CameraWorker(initial_mode="STANDBY", db=self.db, parent=self)
         self.camera_worker.frame_ready.connect(self._on_worker_frame_ready)
         self.camera_worker.metrics_ready.connect(self._on_worker_metrics_ready)
         self.camera_worker.mode_switched.connect(self._on_worker_mode_switched)
+        self.camera_worker.subtitle_updated.connect(self._on_subtitle_updated)
         self.camera_worker.error_occurred.connect(self._on_worker_error)
         self.camera_worker.show_mode_menu.connect(self._on_show_mode_menu)
         self.camera_worker.quit_app.connect(self.close)
@@ -592,6 +598,12 @@ class MainWindow(QMainWindow):
 
     def _update_mode_strip_ui(self) -> None:
         """Cập nhật giao diện phát sáng của các nút chọn Mode bên dưới camera."""
+        if hasattr(self, "subtitle_overlay") and self.subtitle_overlay:
+            if self.is_paused:
+                self.subtitle_overlay.set_active_mode("STANDBY")
+            else:
+                self.subtitle_overlay.set_active_mode(self.current_mode_name)
+
         if self.is_paused:
             self.lbl_mode_badge.setText("⏸ ĐANG TẠM KHÓA")
             self.lbl_mode_badge.setStyleSheet(f"""
@@ -794,6 +806,21 @@ class MainWindow(QMainWindow):
         """Ghi nhận lỗi từ luồng camera."""
         self.lbl_status.setText(f"Lỗi Camera: {err_msg}")
 
+    def _on_subtitle_updated(self, sub_data: dict) -> None:
+        """Cập nhật dữ liệu cho Cửa sổ Phụ đề Nổi Toàn Màn Hình Máy Tính."""
+        if hasattr(self, "subtitle_overlay") and self.subtitle_overlay:
+            self.subtitle_overlay.update_subtitle_data(
+                sentence=sub_data.get("sentence", ""),
+                current_word=sub_data.get("current_word", ""),
+                current_meaning=sub_data.get("current_meaning", ""),
+                confidence=sub_data.get("confidence", 0.0),
+            )
+
+    def _on_subtitle_clear_requested(self) -> None:
+        """Xử lý khi người dùng bấm nút xóa trên thanh phụ đề nổi."""
+        if hasattr(self, "camera_worker") and self.camera_worker and self.camera_worker.sign_controller:
+            self.camera_worker.sign_controller.clear_sentence()
+
     def _toggle_pip(self) -> None:
         """Bật / Tắt chế độ Cửa sổ Mini PiP ghim góc màn hình."""
         from PyQt6.QtWidgets import QApplication
@@ -877,7 +904,9 @@ class MainWindow(QMainWindow):
             self.studio_page.set_active_author(self.active_author)
 
     def closeEvent(self, event) -> None:
-        """Dọn dẹp luồng camera và cửa sổ PiP khi đóng ứng dụng."""
+        """Dọn dẹp luồng camera, cửa sổ phụ đề nổi và cửa sổ PiP khi đóng ứng dụng."""
+        if hasattr(self, "subtitle_overlay") and self.subtitle_overlay:
+            self.subtitle_overlay.close()
         if hasattr(self, "pip_widget") and self.pip_widget:
             self.pip_widget.close()
         if hasattr(self, "camera_worker") and self.camera_worker:

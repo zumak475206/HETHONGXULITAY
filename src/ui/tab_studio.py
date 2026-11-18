@@ -453,6 +453,8 @@ class StudioPage(QWidget):
             is_system=0,
         )
         if ok:
+            if self.camera_worker and hasattr(self.camera_worker, "sign_controller") and self.camera_worker.sign_controller:
+                self.camera_worker.sign_controller.reload_gesture_meanings()
             QMessageBox.information(self, "Thành công", f"Đã thêm cử chỉ '{name}' vào cơ sở dữ liệu!")
             self.txt_gesture_name.clear()
             self.txt_display_name.clear()
@@ -634,6 +636,15 @@ class StudioPage(QWidget):
         gesture_name = self.get_selected_record_gesture()
         arr = np.array(self._record_buffer[:_TARGET_SEQ_LEN], dtype=np.float32)
 
+        # Kiểm tra tính toàn vẹn sinh học: Bắt buộc có bàn tay xuất hiện >= 20/45 frames
+        valid_hand_frames = sum(1 for f in self._record_buffer[:_TARGET_SEQ_LEN] if np.count_nonzero(f[:157]) > 0)
+        if valid_hand_frames < 20 and gesture_name != "IDLE":
+            self.lbl_record_status.setText(f"⚠️ Bàn tay không rõ trong khung hình (chỉ {valid_hand_frames}/45 frames). Mẫu đã hủy, hãy giơ tay rõ và thử lại!")
+            self.lbl_record_status.setStyleSheet(f"color: {COLOR_AMBER}; font-size: 12px; font-weight: 700;")
+            self._reset_record_ui()
+            self._on_record_gesture_changed()
+            return
+
         try:
             saved_file = save_single_sample(
                 sequence=arr,
@@ -728,6 +739,10 @@ class StudioPage(QWidget):
             f"  • Tổn thất (Loss): {loss:.4f}\n"
             f"  • File mô hình: {path} (Đã nạp Hot-Reload thành công)"
         )
+
+        # Tự động nạp Hot-Reload mô hình mới vào CameraWorker
+        if self.camera_worker and hasattr(self.camera_worker, "reload_model"):
+            self.camera_worker.reload_model()
 
         QMessageBox.information(
             self,

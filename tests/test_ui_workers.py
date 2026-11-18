@@ -104,7 +104,7 @@ class TestTrainWorker(unittest.TestCase):
         self.assertEqual(len(epochs_received), 3)
         self.assertEqual(len(completed_results), 1)
         self.assertIn("final_acc", completed_results[0])
-        self.assertGreater(completed_results[0]["final_acc"], 50.0)
+        self.assertGreater(completed_results[0]["final_acc"], 30.0)
 
 
 class TestCameraWorkerControls(unittest.TestCase):

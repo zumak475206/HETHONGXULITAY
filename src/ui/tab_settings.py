@@ -61,6 +61,7 @@ FACTORY_DEFAULTS = {
     "camera_width": 1280,
     "camera_height": 720,
     "clahe_enabled": True,
+    "anatomical_guard_enabled": False,
 }
 
 
@@ -376,6 +377,12 @@ class SettingsPage(QWidget):
         self.chk_clahe.setChecked(True)
         cam_layout.addWidget(self.chk_clahe)
 
+        # 4.4 Checkbox Anatomical Guard
+        self.chk_guard = QCheckBox("Bật bộ lọc bảo vệ sinh học (Anatomical Guard) [Khuyến nghị TẮT để nhận diện nhạy & mượt 100%]")
+        self.chk_guard.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 12px; font-weight: 600; padding: 4px 0;")
+        self.chk_guard.setChecked(False)
+        cam_layout.addWidget(self.chk_guard)
+
         container_layout.addWidget(card_cam)
 
         # ── CARD 5: HỒ SƠ TÁC GIẢ & THAO TÁC HỆ THỐNG ─────────────────────────
@@ -577,6 +584,10 @@ class SettingsPage(QWidget):
             clahe_on = self.db.get_setting("clahe_enabled", "1" if FACTORY_DEFAULTS["clahe_enabled"] else "0")
             self.chk_clahe.setChecked(clahe_on in ["1", "true", "True"])
 
+            # 12. Anatomical Guard
+            guard_on = self.db.get_setting("anatomical_guard_enabled", "1" if FACTORY_DEFAULTS["anatomical_guard_enabled"] else "0")
+            self.chk_guard.setChecked(guard_on in ["1", "true", "True"])
+
             self._dispatch_live_settings()
         except Exception as e:
             print(f"[SettingsPage] Lỗi load settings: {e}")
@@ -596,6 +607,7 @@ class SettingsPage(QWidget):
             "camera_width": 1280 if self.cbo_res.currentIndex() == 0 else 640,
             "camera_height": 720 if self.cbo_res.currentIndex() == 0 else 480,
             "clahe_enabled": self.chk_clahe.isChecked(),
+            "anatomical_guard_enabled": self.chk_guard.isChecked(),
         }
 
     def save_settings(self) -> None:
@@ -614,6 +626,7 @@ class SettingsPage(QWidget):
         self.db.set_setting("camera_width", str(s["camera_width"]), "Độ rộng khung hình camera")
         self.db.set_setting("camera_height", str(s["camera_height"]), "Độ cao khung hình camera")
         self.db.set_setting("clahe_enabled", "1" if s["clahe_enabled"] else "0", "Trạng thái bật/tắt bộ lọc CLAHE")
+        self.db.set_setting("anatomical_guard_enabled", "1" if s["anatomical_guard_enabled"] else "0", "Trạng thái bật/tắt bộ lọc bảo vệ sinh học")
 
         self.active_author = s["active_author"]
         self.author_changed.emit(self.active_author)
@@ -660,6 +673,7 @@ class SettingsPage(QWidget):
         self.cbo_camera_idx.setCurrentIndex(FACTORY_DEFAULTS["camera_index"])
         self.cbo_res.setCurrentIndex(0)  # 1280x720
         self.chk_clahe.setChecked(FACTORY_DEFAULTS["clahe_enabled"])
+        self.chk_guard.setChecked(FACTORY_DEFAULTS["anatomical_guard_enabled"])
 
         # Lưu tự động
         self.save_settings()
@@ -684,6 +698,9 @@ class SettingsPage(QWidget):
 
         if hasattr(self.camera_worker, "set_clahe_enabled"):
             self.camera_worker.set_clahe_enabled(s["clahe_enabled"])
+
+        if hasattr(self.camera_worker, "set_anatomical_guard_enabled"):
+            self.camera_worker.set_anatomical_guard_enabled(s["anatomical_guard_enabled"])
 
         if hasattr(self.camera_worker, "set_two_hand_switch_time"):
             self.camera_worker.set_two_hand_switch_time(s["two_hand_switch_time"])

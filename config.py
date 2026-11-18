@@ -110,12 +110,26 @@ GESTURE_CLASSES = [
     "TWO_HAND_ZOOM_OUT",  # 9: Hai tay thu hẹp / Thu nhỏ (Zoom Out)
 ]
 
+# Tải danh sách nhãn đã huấn luyện từ file persistent nếu có
+CLASSES_JSON_PATH = WEIGHTS_DIR / "classes.json"
+if CLASSES_JSON_PATH.exists():
+    try:
+        import json
+        with open(CLASSES_JSON_PATH, "r", encoding="utf-8") as f:
+            _saved_cls = json.load(f)
+            if isinstance(_saved_cls, list) and len(_saved_cls) >= len(GESTURE_CLASSES):
+                GESTURE_CLASSES = _saved_cls
+    except Exception:
+        pass
+
+NUM_CLASSES = len(GESTURE_CLASSES)
+
 # Danh mục cử chỉ hợp lệ theo từng Mode (Context Gate Filtering)
 MODE_GESTURE_CLASSES = {
     0: ["IDLE"],
     1: ["IDLE", "PINCH_CLICK", "FIST_LOCK"],
     2: ["IDLE", "FIST_LOCK", "OPEN_PALM", "SWIPE_LEFT", "SWIPE_RIGHT", "SWIPE_UP", "SWIPE_DOWN", "TWO_HAND_ZOOM_IN", "TWO_HAND_ZOOM_OUT"],
-    3: ["IDLE", "FIST_LOCK", "OPEN_PALM"],
+    3: [c for c in GESTURE_CLASSES if c not in ("PINCH_CLICK", "SWIPE_LEFT", "SWIPE_RIGHT", "SWIPE_UP", "SWIPE_DOWN", "TWO_HAND_ZOOM_IN", "TWO_HAND_ZOOM_OUT")],
 }
 
 # ── 7. ĐIỀU KHIỂN CHUỘT THỜI GIAN THỰC (MODE 1: GEOMETRIC MOUSE CONTROLLER) ───
@@ -157,11 +171,11 @@ SCROLL_KINETIC_ACCEL           = True   # Fallback cho TOUCHPAD mode
 SCROLL_MAX_SPEED               = 15     # Fallback cho TOUCHPAD mode
 
 # ── 8. BỘ LỌC GIẢI PHẪU HỌC SINH HỌC (ANATOMICAL SANITY GUARD) ───────────────
-ANATOMICAL_GUARD_ENABLED       = True   # Bật bộ lọc giải phẫu học sinh học
-MAX_FINGER_PALM_RATIO          = 1.25   # Chiều dài ngón / kích thước lòng bàn tay <= 1.25
-MAX_SEGMENT_PALM_RATIO         = 0.85   # Chiều dài 1 đốt xương / kích thước lòng bàn tay <= 0.85
-MIN_PHALANX_RATIO              = 0.35   # Tỷ lệ tối thiểu giữa các đốt xương kế cận
-MAX_PHALANX_RATIO              = 3.5    # Tỷ lệ tối đa giữa các đốt xương kế cận
+ANATOMICAL_GUARD_ENABLED       = False  # Mặc định TẮT để khôi phục 100% độ nhạy, mượt mà và nhận diện đa góc của MediaPipe
+MAX_FINGER_PALM_RATIO          = 1.60   # Chiều dài ngón / kích thước lòng bàn tay (nới lỏng tránh drop khi tay nghiêng)
+MAX_SEGMENT_PALM_RATIO         = 1.10   # Chiều dài 1 đốt xương / kích thước lòng bàn tay
+MIN_PHALANX_RATIO              = 0.15   # Tỷ lệ tối thiểu giữa các đốt xương kế cận
+MAX_PHALANX_RATIO              = 6.00   # Tỷ lệ tối đa giữa các đốt xương kế cận (phù hợp phối cảnh 2D)
 
 # ── 9. MEDIA PIPE LANDMARK INDICES ────────────────────────────────────────────
 WRIST            = 0

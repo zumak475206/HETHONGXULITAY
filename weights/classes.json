@@ -1,0 +1,16 @@
+[
+  "IDLE",
+  "PINCH_CLICK",
+  "FIST_LOCK",
+  "OPEN_PALM",
+  "SWIPE_LEFT",
+  "SWIPE_RIGHT",
+  "SWIPE_UP",
+  "SWIPE_DOWN",
+  "TWO_HAND_ZOOM_IN",
+  "TWO_HAND_ZOOM_OUT",
+  "TEST_VSL_HELLO",
+  "VSL_SO0",
+  "VSL_SO1",
+  "VSL_SO2"
+]

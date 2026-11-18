@@ -26,6 +26,8 @@ from src.preprocessing.clahe_enhancer import CLAHEEnhancer
 from src.tracking.kalman_filter import HandKalmanFilter
 from src.tracking.anatomical_guard import AnatomicalGuard
 from src.modes.mode1_mouse import MouseController
+from src.modes.mode2_presentation import PresentationController
+from src.modes.mode3_sign_language import SignLanguageController
 from src.features.feature_extractor import extract_158d_features
 from src.inference.voting_smoother import VotingSmoother
 from src.actions.dispatcher import ActionDispatcher
@@ -80,6 +82,7 @@ class CameraWorker(QThread):
     metrics_ready = pyqtSignal(float, float, str, str, str)  # fps, latency_ms, action, pipeline, guard
     mode_switched = pyqtSignal(str)                           # new_mode_name
     feature_ready = pyqtSignal(list)                          # 158D feature vector cho Studio thu thập mẫu
+    subtitle_updated = pyqtSignal(dict)                       # Trạng thái phụ đề cho DesktopSubtitleOverlay
     error_occurred = pyqtSignal(str)
     show_mode_menu = pyqtSignal()                             # Yêu cầu UI hiển thị overlay menu chọn mode
     quit_app = pyqtSignal()                                   # Yêu cầu thoát toàn bộ ứng dụng
@@ -87,11 +90,18 @@ class CameraWorker(QThread):
     # Hằng thời gian giữ cử chỉ (giây)
     GESTURE_HOLD_SEC: float = 1.5
 
-    def __init__(self, initial_mode: str = "STANDBY", parent=None):
+    def __init__(self, initial_mode: str = "STANDBY", db=None, parent=None):
         super().__init__(parent)
+        self.db = db
+        if self.db is None:
+            try:
+                from src.database.db_manager import DatabaseManager
+                self.db = DatabaseManager()
+            except Exception:
+                pass
         # App-level state machine: STANDBY | MENU_OPEN | MODE1_MOUSE | MODE2_GESTURES | MODE3_SIGN
-        self.app_state: str = "STANDBY"
-        self.current_mode = "STANDBY"   # backward-compat alias
+        self.app_state: str = initial_mode
+        self.current_mode = initial_mode   # backward-compat alias
         self.is_paused = False
         self.mouse_paused = False
         self.recording_mode_id: Optional[int] = None
@@ -99,7 +109,11 @@ class CameraWorker(QThread):
 
         # Trạng thái tham số động
         self.mouse_controller: Optional[MouseController] = None
+        self.presentation_controller: Optional[PresentationController] = None
+        self.sign_controller: Optional[SignLanguageController] = None
+        self.anatomical_guard: Optional[AnatomicalGuard] = None
         self.enhancer: Optional[CLAHEEnhancer] = None
+        self._new_ort_session: Optional[Any] = None
         self.two_hand_switch_time: float = 1.5  # kept for compat, state-machine uses GESTURE_HOLD_SEC
 
         # Hàng đợi điều phối hành động OS
@@ -169,8 +183,31 @@ class CameraWorker(QThread):
 
     @staticmethod
     def is_hand_fisted(hand_pts: list) -> bool:
-        """Bàn tay nắm lại: <= 1 ngón duỗi."""
-        return CameraWorker.count_extended_fingers(hand_pts) <= 1
+        """
+        Bàn tay nắm lại thực sự (Clenched Fist): các ngón co chặt và không phải cử chỉ hình chữ O / Số 0.
+        """
+        if not hand_pts or len(hand_pts) < 21:
+            return False
+        if CameraWorker.count_extended_fingers(hand_pts) > 1:
+            return False
+
+        # Loại trừ hình chữ O / Số 0 (vòng tròn ngón cái chạm ngón trỏ):
+        # Trong cử chỉ chữ O/Số 0, ngón trỏ vươn cong tạo vòng hở với ngón cái
+        lm = {p[0]: np.array([p[1], p[2], p[3]], dtype=np.float32) for p in hand_pts}
+        w = lm[0]
+        middle_mcp = lm[9]
+        palm_size = float(np.linalg.norm(middle_mcp - w))
+        if palm_size < 1e-4:
+            return False
+        d_thumb_index = float(np.linalg.norm(lm[4] - lm[8])) / palm_size
+        d_index_wrist = float(np.linalg.norm(lm[8] - w)) / palm_size
+
+        # Nếu đầu ngón cái và đầu ngón trỏ áp sát tạo vòng tròn (< 0.50 palm_size) và vươn vòng (> 0.50 palm_size)
+        # thì đây là ký hiệu số 0 / chữ O, không phải nắm đấm khóa màn hình
+        if d_thumb_index < 0.50 and d_index_wrist > 0.50:
+            return False
+
+        return True
 
     def update_mouse_settings(
         self,
@@ -196,6 +233,26 @@ class CameraWorker(QThread):
         """Bật hoặc tắt bộ lọc cải thiện ảnh CLAHE."""
         if self.enhancer:
             self.enhancer.enabled = bool(enabled)
+
+    def set_anatomical_guard_enabled(self, enabled: bool) -> None:
+        """Bật hoặc tắt bộ lọc bảo vệ sinh học Anatomical Guard."""
+        if hasattr(self, "anatomical_guard") and self.anatomical_guard:
+            self.anatomical_guard.enabled = bool(enabled)
+
+    def reload_model(self, onnx_path: Optional[Any] = None) -> bool:
+        """Hot-Reload mô hình mới nạp trực tiếp vào luồng camera đang chạy."""
+        try:
+            import onnxruntime as ort
+            target_path = Path(onnx_path) if onnx_path else config.MODEL_ONNX_PATH
+            if target_path.exists():
+                new_session = ort.InferenceSession(str(target_path), providers=["CPUExecutionProvider"])
+                self._new_ort_session = new_session
+                if self.sign_controller:
+                    self.sign_controller.reload_gesture_meanings()
+                return True
+        except Exception as e:
+            print(f"[CameraWorker] Loi hot-reload model: {e}")
+        return False
 
     def set_two_hand_switch_time(self, duration_sec: float) -> None:
         """Cập nhật thời gian giữ 2 tay để chuyển Mode."""
@@ -286,7 +343,9 @@ class CameraWorker(QThread):
                 fist1 = self.is_hand_fisted(raw_hands_data[1])
                 if fist0 and fist1:
                     gesture_key = "BOTH_FIST"  # → về menu
-            elif n_hands == 1:
+            elif n_hands == 1 and self.current_mode != "MODE3_SIGN":
+                # Trong Mode 3 (Ký hiệu), người dùng thường xuyên dùng 1 tay làm ký hiệu (số 0, nắm, chữ O, v.v.)
+                # nên cấm dùng 1 tay để khóa màn hình; chỉ Mode 1 & 2 mới dùng 1 nắm tay để khóa
                 if self.is_hand_fisted(raw_hands_data[0]):
                     gesture_key = "ONE_FIST"   # → khóa màn hình / standby
 
@@ -450,17 +509,33 @@ class CameraWorker(QThread):
             cooldown_sec=config.ACTION_COOLDOWN_SEC,
         )
         anatomical_guard = AnatomicalGuard(
-            enabled=getattr(config, "ANATOMICAL_GUARD_ENABLED", True),
-            max_finger_palm_ratio=getattr(config, "MAX_FINGER_PALM_RATIO", 1.25),
-            max_segment_palm_ratio=getattr(config, "MAX_SEGMENT_PALM_RATIO", 0.85),
-            min_phalanx_ratio=getattr(config, "MIN_PHALANX_RATIO", 0.35),
-            max_phalanx_ratio=getattr(config, "MAX_PHALANX_RATIO", 3.50),
+            enabled=getattr(config, "ANATOMICAL_GUARD_ENABLED", False),
+            max_finger_palm_ratio=getattr(config, "MAX_FINGER_PALM_RATIO", 1.60),
+            max_segment_palm_ratio=getattr(config, "MAX_SEGMENT_PALM_RATIO", 1.10),
+            min_phalanx_ratio=getattr(config, "MIN_PHALANX_RATIO", 0.15),
+            max_phalanx_ratio=getattr(config, "MAX_PHALANX_RATIO", 6.00),
         )
+        self.anatomical_guard = anatomical_guard
         mouse_controller = MouseController(
             frame_w=config.CAMERA_WIDTH,
             frame_h=config.CAMERA_HEIGHT,
         )
         self.mouse_controller = mouse_controller
+
+        presentation_controller = PresentationController(
+            frame_w=config.CAMERA_WIDTH,
+            frame_h=config.CAMERA_HEIGHT,
+            action_queue=self.action_queue,
+        )
+        self.presentation_controller = presentation_controller
+
+        sign_controller = SignLanguageController(
+            frame_w=config.CAMERA_WIDTH,
+            frame_h=config.CAMERA_HEIGHT,
+            db=getattr(self, "db", None),
+            action_queue=self.action_queue,
+        )
+        self.sign_controller = sign_controller
 
         mp_detector = None
         if mp_hands:
@@ -497,6 +572,11 @@ class CameraWorker(QThread):
         # Vòng lặp chính
         while self._is_running:
             loop_start = time.time()
+
+            # Hot-Reload mô hình mới nếu vừa huấn luyện xong
+            if self._new_ort_session is not None:
+                ort_session = self._new_ort_session
+                self._new_ort_session = None
 
             frame = None
             if camera and camera.isOpened():
@@ -535,7 +615,7 @@ class CameraWorker(QThread):
             hands_data = []
             raw_hands_data = []
             velocities = []
-            guard_status = "HOẠT ĐỘNG (An toàn)"
+            guard_status = "BẬT (An toàn)" if (self.anatomical_guard and self.anatomical_guard.enabled) else "TẮT (Mượt 100% MediaPipe)"
 
             if mp_detector:
                 results = mp_detector.process(rgb)
@@ -557,16 +637,21 @@ class CameraWorker(QThread):
                         raw_pts = [(i, l.x * w, l.y * h, l.z * w) for i, l in enumerate(hand_lms.landmark)]
 
                         # Bộ lọc giải phẫu học sinh học (Anatomical Guard)
-                        is_valid_anatomy, guard_reason = anatomical_guard.validate_hand(raw_pts)
-                        if not is_valid_anatomy:
-                            guard_status = f"CHẶN: {guard_reason}"
-                            cv2.putText(enhanced, f"CHAN DI DANG: {guard_reason}", (15, h - 60),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
-                            smoothed_pts, is_valid = kalman_hands[h_idx].update(None)
-                            if is_valid:
-                                hands_data.append(smoothed_pts)
-                                velocities.append(kalman_hands[h_idx].get_hand_velocity())
-                            continue
+                        if anatomical_guard.enabled:
+                            is_valid_anatomy, guard_reason = anatomical_guard.validate_hand(raw_pts)
+                            if not is_valid_anatomy:
+                                guard_status = f"CHẶN: {guard_reason}"
+                                cv2.putText(enhanced, f"CHAN DI DANG: {guard_reason}", (15, h - 60),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
+                                smoothed_pts, is_valid = kalman_hands[h_idx].update(None)
+                                if is_valid:
+                                    hands_data.append(smoothed_pts)
+                                    velocities.append(kalman_hands[h_idx].get_hand_velocity())
+                                continue
+                            else:
+                                guard_status = "BẬT (An toàn)"
+                        else:
+                            guard_status = "TẮT (Mượt 100% MediaPipe)"
 
                         # Vẽ khung xương bàn tay
                         if mp_drawing:
@@ -667,36 +752,78 @@ class CameraWorker(QThread):
                     pipeline_text = "Studio / Recording (Chuột tạm dừng)"
                     action_text = "Tạm dừng chuột (Chế độ Studio/Quay)"
 
-            else:
-                # Mode 2 & Mode 3: Bi-LSTM 158D Context Gate
-                pipeline_text = "Bi-LSTM 158D Context Gate"
-                raw_class_idx = 0
-                raw_conf = 0.0
+                self.subtitle_updated.emit({
+                    "sentence": "",
+                    "current_word": "",
+                    "current_meaning": "",
+                    "confidence": 0.0,
+                    "is_active": False,
+                })
 
-                if len(self.temporal_buffer) == config.SEQUENCE_LENGTH and len(hands_data) > 0:
+            elif self.current_mode == "MODE2_GESTURES":
+                # Mode 2: Trình chiếu Slide (Kinematic Fast-Swipe + L-Sign F5)
+                pipeline_text = "Mode 2: Trinh Chieu Slide"
+                if not getattr(self, "mouse_paused", False):
+                    presentation_controller.process(enhanced, raw_hands_data)
+                    action_text = presentation_controller.action_text or "San sang trinh chieu"
+                else:
+                    pipeline_text = "Studio / Recording (Mode 2 tam dung)"
+                    action_text = "Tam dung Mode 2 (Che do Studio/Quay)"
+
+                self.subtitle_updated.emit({
+                    "sentence": "",
+                    "current_word": "",
+                    "current_meaning": "",
+                    "confidence": 0.0,
+                    "is_active": False,
+                })
+
+            elif self.current_mode == "MODE3_SIGN":
+                # Mode 3: Nhận diện Ngôn ngữ ký hiệu VSL & Phụ đề máy tính (158D Context Gate)
+                pipeline_text = "Mode 3: VSL Sign Language (158D)"
+                has_hands = (len(raw_hands_data) > 0)
+                num_classes = len(config.GESTURE_CLASSES)
+                logits = np.zeros(num_classes, dtype=np.float32)
+                attn_weights = np.zeros(config.SEQUENCE_LENGTH, dtype=np.float32)
+
+                if len(self.temporal_buffer) == config.SEQUENCE_LENGTH and has_hands:
                     seq_np = np.array([self.temporal_buffer], dtype=np.float32)
                     if ort_session is not None:
-                        ort_outs = ort_session.run(None, {"input_sequence": seq_np})
-                        logits = ort_outs[0][0]
-                        attn_weights = ort_outs[1][0] if len(ort_outs) > 1 else np.zeros(config.SEQUENCE_LENGTH)
-                        exp_l = np.exp(logits - np.max(logits))
-                        probs = exp_l / np.sum(exp_l)
-                        raw_class_idx = int(np.argmax(probs))
-                        raw_conf = float(probs[raw_class_idx])
+                        try:
+                            ort_outs = ort_session.run(None, {"input_sequence": seq_np})
+                            logits = ort_outs[0][0]
+                            if len(ort_outs) > 1 and ort_outs[1] is not None:
+                                attn_weights = ort_outs[1][0]
+                        except Exception:
+                            pass
 
-                predicted_label = config.GESTURE_CLASSES[raw_class_idx] if len(hands_data) > 0 else "IDLE"
-                allowed_classes = config.MODE_GESTURE_CLASSES.get(mode_val, config.GESTURE_CLASSES)
-                raw_label_name = predicted_label if predicted_label in allowed_classes else "IDLE"
+                if self.sign_controller is not None:
+                    raw_lbl, conf, sentence = self.sign_controller.process_inference(
+                        logits=logits,
+                        attn_weights=attn_weights,
+                        class_list=config.GESTURE_CLASSES,
+                        has_hands=has_hands,
+                        raw_hands_data=raw_hands_data,
+                    )
+                    self.sign_controller.draw_hud(enhanced, hands_data=hands_data, raw_hands_data=raw_hands_data)
+                    sub_state = self.sign_controller.get_subtitle_state()
+                    self.subtitle_updated.emit(sub_state)
 
-                action_to_fire, curr_confidence, curr_stable_label = smoother.update(raw_label_name, raw_conf)
-                if action_to_fire:
-                    try:
-                        self.action_queue.put_nowait({"action": action_to_fire, "payload": {}})
-                    except queue.Full:
-                        pass
-
-                action_text = f"Cử chỉ: {curr_stable_label} ({curr_confidence*100:.0f}%)"
-                draw_attention_heatmap(enhanced, attn_weights, x=25, y=h - 40, w=240, h=18)
+                    cur_meaning = sub_state.get("current_meaning", "") or sub_state.get("current_word", "Chờ ký hiệu")
+                    action_text = f"VSL: {cur_meaning} ({sub_state.get('confidence', 0.0)*100:.0f}%)"
+                else:
+                    action_text = "VSL: Sẵn sàng dịch"
+            else:
+                # Trạng thái STANDBY hoặc MENU_OPEN
+                pipeline_text = "Standby"
+                action_text = "Chờ cử chỉ"
+                self.subtitle_updated.emit({
+                    "sentence": "",
+                    "current_word": "",
+                    "current_meaning": "",
+                    "confidence": 0.0,
+                    "is_active": False,
+                })
 
             # Tính toán FPS và độ trễ
             loop_end = time.time()
@@ -723,11 +850,21 @@ class TrainWorker(QThread):
     training_completed = pyqtSignal(dict)                # summary stats
     training_failed = pyqtSignal(str)
 
-    def __init__(self, db=None, epochs: int = 20, batch_size: int = 32, parent=None):
+    def __init__(
+        self,
+        db=None,
+        epochs: int = 35,
+        batch_size: int = 32,
+        sequences_dir: Optional[Any] = None,
+        include_legacy: bool = True,
+        parent=None,
+    ):
         super().__init__(parent)
         self.db = db
         self.epochs = epochs
         self.batch_size = batch_size
+        self.sequences_dir = sequences_dir
+        self.include_legacy = include_legacy
         self._is_cancelled = False
 
     def cancel(self) -> None:
@@ -735,33 +872,182 @@ class TrainWorker(QThread):
         self._is_cancelled = True
 
     def run(self) -> None:
-        """Thực thi tiến trình huấn luyện mô hình."""
+        """Thực thi tiến trình huấn luyện mô hình PyTorch thực tế."""
         try:
             from src.database.dataset_merger import load_merged_dataset
-            X, y, classes = load_merged_dataset(db=self.db, include_legacy=True)
+            from src.models.bilstm_attention import MultiScaleBiLSTMAttention
+            from src.training.train import export_to_onnx, quantize_onnx_int8
+
+            X, y, classes = load_merged_dataset(
+                db=self.db,
+                sequences_dir=self.sequences_dir,
+                include_legacy=self.include_legacy,
+                filter_empty_hands=True,
+            )
             if len(X) == 0:
                 self.training_failed.emit("Không tìm thấy mẫu nào trong cơ sở dữ liệu để huấn luyện!")
                 return
 
+            # Thêm mẫu cơ sở cho Mode 3 (IDLE, OPEN_PALM với Context Gate = 0.75)
+            # Giúp mô hình hiểu rằng trong Mode 3, tay nghỉ vẫn là IDLE, tay xòe vẫn là OPEN_PALM!
+            extra_m3_X = []
+            extra_m3_y = []
+            for base_name in ["IDLE", "OPEN_PALM", "FIST_LOCK"]:
+                if base_name in classes:
+                    b_idx = classes.index(base_name)
+                    b_indices = [i for i, lbl in enumerate(y) if lbl == b_idx]
+                    for idx in b_indices[:20]:
+                        seq_copy = np.array(X[idx], copy=True)
+                        seq_copy[:, 157] = 3.0 / 4.0  # Mode 3 Gate = 0.75
+                        extra_m3_X.append(seq_copy)
+                        extra_m3_y.append(b_idx)
+            if extra_m3_X:
+                X = np.concatenate([X, np.array(extra_m3_X, dtype=np.float32)], axis=0)
+                y = np.concatenate([y, np.array(extra_m3_y, dtype=np.int64)], axis=0)
+
+            # Tăng cường dữ liệu (Geometric Data Augmentation & Oversampling) cho các lớp thiểu số
+            target_samples = max(40, int(np.median(np.bincount(y))))
+            class_counts = np.bincount(y, minlength=len(classes))
+
+            X_aug_list = list(X)
+            y_aug_list = list(y)
+
+            for c_idx in range(len(classes)):
+                cnt = class_counts[c_idx]
+                if 0 < cnt < target_samples:
+                    needed = target_samples - cnt
+                    c_indices = [i for i, label in enumerate(y) if label == c_idx]
+                    for k in range(needed):
+                        src_idx = c_indices[k % len(c_indices)]
+                        src_seq = np.array(X[src_idx], copy=True)
+                        # Biến thiên hình học: Scale tọa độ 0.96 - 1.04
+                        scale = np.random.uniform(0.96, 1.04)
+                        src_seq[:, 0:63] *= scale
+                        src_seq[:, 76:139] *= scale
+
+                        # Nhiễu góc khớp ngón tay
+                        angle_jitter = np.random.normal(0, 0.015, size=src_seq[:, 63:73].shape).astype(np.float32)
+                        src_seq[:, 63:73] = np.clip(src_seq[:, 63:73] + angle_jitter, 0.0, 1.0)
+
+                        # Context Gate Dropout (25% cơ hội set gate=0.0 để mạng học đặc trưng hình học ngón tay)
+                        if np.random.rand() < 0.25:
+                            src_seq[:, 157] = 0.0
+
+                        X_aug_list.append(src_seq)
+                        y_aug_list.append(c_idx)
+
+            X_aug_arr = np.array(X_aug_list, dtype=np.float32)
+            y_aug_arr = np.array(y_aug_list, dtype=np.int64)
+
             total_epochs = self.epochs
-            # Mô phỏng / huấn luyện từng epoch
+            batch_sz = max(1, min(self.batch_size, len(X_aug_arr)))
+
+            # Dataset & DataLoader PyTorch
+            X_tensor = torch.tensor(X_aug_arr, dtype=torch.float32)
+            y_tensor = torch.tensor(y_aug_arr, dtype=torch.long)
+            dataset = torch.utils.data.TensorDataset(X_tensor, y_tensor)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=batch_sz, shuffle=True)
+
+            device = torch.device("cuda:0" if (torch.cuda.is_available() and "cuda" in config.DEVICE) else "cpu")
+
+            num_classes = max(2, len(classes))
+            model = MultiScaleBiLSTMAttention(
+                input_dim=config.FEATURE_DIM,
+                cnn_branch_channels=32,
+                lstm_hidden_size=config.LSTM_HIDDEN_SIZE,
+                lstm_num_layers=config.LSTM_NUM_LAYERS,
+                lstm_dropout=config.LSTM_DROPOUT,
+                num_classes=num_classes,
+            ).to(device)
+
+            # Nạp trọng số Backbone tiền huấn luyện nếu có (Warm-Start Transfer Learning)
+            if config.MODEL_PT_PATH.exists():
+                try:
+                    state = torch.load(config.MODEL_PT_PATH, map_location=device)
+                    model_state = model.state_dict()
+                    compatible_state = {
+                        k: v for k, v in state.items()
+                        if k in model_state and v.shape == model_state[k].shape
+                    }
+                    model_state.update(compatible_state)
+                    model.load_state_dict(model_state)
+                except Exception:
+                    pass
+
+            # Trọng số phân lớp cân bằng
+            aug_counts = np.bincount(y_aug_arr, minlength=len(classes))
+            weights = len(y_aug_arr) / (len(classes) * np.maximum(1, aug_counts))
+            weights_tensor = torch.tensor(weights, dtype=torch.float32).to(device)
+            criterion = torch.nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=0.03)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-3)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_epochs))
+
+            final_loss = 1.0
+            final_acc = 0.0
+
             for ep in range(1, total_epochs + 1):
                 if self._is_cancelled:
                     self.training_failed.emit("Người dùng đã hủy huấn luyện.")
                     return
 
-                # Giả lập giảm loss và tăng acc thực tế
-                sim_loss = max(0.04, 1.25 * (0.88 ** ep))
-                sim_acc = min(99.2, 60.0 + (ep / total_epochs) * 38.5)
-                time.sleep(0.08)  # Đảm bảo UI mượt mà
+                model.train()
+                running_loss = 0.0
+                correct = 0
+                total = 0
 
-                self.epoch_progress.emit(ep, total_epochs, float(sim_loss), float(sim_acc))
+                for batch_x, batch_y in loader:
+                    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                    optimizer.zero_grad()
+
+                    logits, _ = model(batch_x)
+                    loss = criterion(logits, batch_y)
+                    loss.backward()
+                    optimizer.step()
+
+                    running_loss += loss.item() * len(batch_y)
+                    preds = torch.argmax(logits, dim=1)
+                    correct += (preds == batch_y).sum().item()
+                    total += len(batch_y)
+
+                scheduler.step()
+                epoch_loss = running_loss / max(1, total)
+                epoch_acc = (correct / max(1, total)) * 100.0
+                final_loss = epoch_loss
+                final_acc = epoch_acc
+
+                self.epoch_progress.emit(ep, total_epochs, float(epoch_loss), float(epoch_acc))
+
+            # Lưu weights PyTorch
+            config.WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                torch.save(model.state_dict(), config.MODEL_PT_PATH)
+            except Exception as e:
+                print(f"[TrainWorker] Warning: Không thể lưu weights .pt ({e})")
+
+            # Cập nhật danh sách class toàn hệ thống & ghi file persistent
+            config.GESTURE_CLASSES = list(classes)
+            config.NUM_CLASSES = len(classes)
+            try:
+                import json
+                with open(config.CLASSES_JSON_PATH, "w", encoding="utf-8") as f:
+                    json.dump(list(classes), f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+            # Xuất sang ONNX FP32
+            export_to_onnx(model, config.MODEL_ONNX_PATH, input_dim=config.FEATURE_DIM, seq_len=config.SEQUENCE_LENGTH)
+
+            # Lượng tử hóa INT8
+            try:
+                quantize_onnx_int8(config.MODEL_ONNX_PATH, config.MODEL_INT8_PATH, model_cpu=model.to("cpu"))
+            except Exception:
+                pass
 
             summary = {
                 "total_samples": len(X),
                 "total_classes": len(classes),
-                "final_loss": round(sim_loss, 4),
-                "final_acc": round(sim_acc, 2),
+                "final_loss": round(final_loss, 4),
+                "final_acc": round(final_acc, 2),
                 "model_path": str(config.MODEL_ONNX_PATH.name),
             }
             self.training_completed.emit(summary)

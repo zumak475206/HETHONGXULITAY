@@ -172,6 +172,7 @@ def load_merged_dataset(
     include_legacy: bool = True,
     target_seq_len: int = 45,
     target_dim: int = 158,
+    filter_empty_hands: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Tải và gộp toàn bộ dữ liệu từ:
@@ -191,31 +192,37 @@ def load_merged_dataset(
     if seq_dir.exists():
         for npz_file in seq_dir.rglob("*.npz"):
             try:
-                data = np.load(npz_file, allow_pickle=True)
-                seq = data.get("sequence", None)
-                if seq is None or len(seq.shape) != 2:
-                    continue
-                g_name = str(data.get("gesture_name", npz_file.parent.name)).strip().upper()
+                with np.load(npz_file, allow_pickle=True) as data:
+                    seq = data.get("sequence", None)
+                    if seq is None or len(seq.shape) != 2:
+                        continue
+                    g_name = str(data.get("gesture_name", npz_file.parent.name)).strip().upper()
 
-                # Resample số frame về target_seq_len nếu cần
-                curr_len, curr_dim = seq.shape
-                if curr_len != target_seq_len:
-                    x_old = np.linspace(0, 1, curr_len)
-                    x_new = np.linspace(0, 1, target_seq_len)
-                    resampled = np.zeros((target_seq_len, curr_dim), dtype=np.float32)
-                    for d in range(curr_dim):
-                        resampled[:, d] = np.interp(x_new, x_old, seq[:, d])
-                    seq = resampled
+                    # Bỏ qua mẫu rác không có bàn tay thực tế (< 15 frame có tay) nếu filter_empty_hands=True
+                    if filter_empty_hands:
+                        hand_frames = sum(1 for t in range(len(seq)) if np.count_nonzero(seq[t, :157]) > 0)
+                        if hand_frames < 15 and g_name != "IDLE":
+                            continue
 
-                # Điều chỉnh số chiều về target_dim
-                if curr_dim < target_dim:
-                    pad = np.zeros((target_seq_len, target_dim - curr_dim), dtype=np.float32)
-                    seq = np.concatenate([seq, pad], axis=-1)
-                elif curr_dim > target_dim:
-                    seq = seq[:, :target_dim]
+                    # Resample số frame về target_seq_len nếu cần
+                    curr_len, curr_dim = seq.shape
+                    if curr_len != target_seq_len:
+                        x_old = np.linspace(0, 1, curr_len)
+                        x_new = np.linspace(0, 1, target_seq_len)
+                        resampled = np.zeros((target_seq_len, curr_dim), dtype=np.float32)
+                        for d in range(curr_dim):
+                            resampled[:, d] = np.interp(x_new, x_old, seq[:, d])
+                        seq = resampled
 
-                all_sequences.append(seq)
-                all_labels.append(g_name)
+                    # Điều chỉnh số chiều về target_dim
+                    if curr_dim < target_dim:
+                        pad = np.zeros((target_seq_len, target_dim - curr_dim), dtype=np.float32)
+                        seq = np.concatenate([seq, pad], axis=-1)
+                    elif curr_dim > target_dim:
+                        seq = seq[:, :target_dim]
+
+                    all_sequences.append(seq)
+                    all_labels.append(g_name)
             except Exception:
                 continue
 
@@ -224,30 +231,36 @@ def load_merged_dataset(
         leg_path = Path(legacy_file) if legacy_file else LEGACY_DATASET_FILE
         if leg_path.exists():
             try:
-                data = np.load(leg_path, allow_pickle=True)
-                if "X" in data and "y" in data:
-                    leg_X = data["X"]
-                    leg_y = data["y"]
-                    # Chuẩn hóa shape
-                    for i in range(len(leg_y)):
-                        sample = leg_X[i]
-                        curr_len, curr_dim = sample.shape
-                        if curr_len != target_seq_len:
-                            x_old = np.linspace(0, 1, curr_len)
-                            x_new = np.linspace(0, 1, target_seq_len)
-                            resampled = np.zeros((target_seq_len, curr_dim), dtype=np.float32)
-                            for d in range(curr_dim):
-                                resampled[:, d] = np.interp(x_new, x_old, sample[:, d])
-                            sample = resampled
-                        if curr_dim < target_dim:
-                            pad = np.zeros((target_seq_len, target_dim - curr_dim), dtype=np.float32)
-                            sample = np.concatenate([sample, pad], axis=-1)
-                        elif curr_dim > target_dim:
-                            sample = sample[:, :target_dim]
+                with np.load(leg_path, allow_pickle=True) as data:
+                    if "X" in data and "y" in data:
+                        leg_X = data["X"]
+                        leg_y = data["y"]
+                        # Chuẩn hóa shape
+                        for i in range(len(leg_y)):
+                            sample = leg_X[i]
+                            # Kiểm tra mẫu hợp lệ nếu bật bộ lọc
+                            cls_name = config.GESTURE_CLASSES[int(leg_y[i])] if int(leg_y[i]) < len(config.GESTURE_CLASSES) else f"GESTURE_{leg_y[i]}"
+                            if filter_empty_hands:
+                                hand_frames = sum(1 for t in range(len(sample)) if np.count_nonzero(sample[t, :157]) > 0)
+                                if hand_frames < 15 and cls_name != "IDLE":
+                                    continue
 
-                        cls_name = config.GESTURE_CLASSES[int(leg_y[i])] if int(leg_y[i]) < len(config.GESTURE_CLASSES) else f"GESTURE_{leg_y[i]}"
-                        all_sequences.append(sample)
-                        all_labels.append(cls_name)
+                            curr_len, curr_dim = sample.shape
+                            if curr_len != target_seq_len:
+                                x_old = np.linspace(0, 1, curr_len)
+                                x_new = np.linspace(0, 1, target_seq_len)
+                                resampled = np.zeros((target_seq_len, curr_dim), dtype=np.float32)
+                                for d in range(curr_dim):
+                                    resampled[:, d] = np.interp(x_new, x_old, sample[:, d])
+                                sample = resampled
+                            if curr_dim < target_dim:
+                                pad = np.zeros((target_seq_len, target_dim - curr_dim), dtype=np.float32)
+                                sample = np.concatenate([sample, pad], axis=-1)
+                            elif curr_dim > target_dim:
+                                sample = sample[:, :target_dim]
+
+                            all_sequences.append(sample)
+                            all_labels.append(cls_name)
             except Exception:
                 pass
 

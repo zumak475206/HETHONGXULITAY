@@ -91,6 +91,10 @@ class ActionDispatcher(threading.Thread):
                 # Tạm dừng / Play media
                 pyautogui.press("space")
 
+            elif action_name in ("PRESENTATION_START", "PRESENTATION_F5"):
+                # Bắt đầu / Bật trình chiếu toàn màn hình (phím F5)
+                pyautogui.press("f5")
+
             elif action_name == "FAILSAFE_RELEASE":
                 # Nhả chuột và các phím bổ trợ nếu bàn tay bất ngờ biến mất khỏi camera
                 pyautogui.mouseUp()

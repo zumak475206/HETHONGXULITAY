@@ -33,34 +33,35 @@ class AnatomicalGuard:
 
     def __init__(
         self,
-        enabled: bool = True,
-        max_finger_palm_ratio: float = 1.25,
-        max_segment_palm_ratio: float = 0.85,
-        min_phalanx_ratio: float = 0.35,
-        max_phalanx_ratio: float = 3.50,
+        enabled: Optional[bool] = None,
+        max_finger_palm_ratio: Optional[float] = None,
+        max_segment_palm_ratio: Optional[float] = None,
+        min_phalanx_ratio: Optional[float] = None,
+        max_phalanx_ratio: Optional[float] = None,
         min_palm_size: float = 10.0,
     ):
         """
         Tham số
         -------
         enabled : bool
-            Bật/tắt bộ lọc bảo vệ.
+            Bật/tắt bộ lọc bảo vệ (mặc định lấy theo config.ANATOMICAL_GUARD_ENABLED).
         max_finger_palm_ratio : float
-            Tỷ lệ chiều dài tối đa của ngón tay so với lòng bàn tay (mặc định 1.25).
+            Tỷ lệ chiều dài tối đa của ngón tay so với lòng bàn tay.
         max_segment_palm_ratio : float
-            Tỷ lệ tối đa của 1 đốt xương đơn lẻ so với lòng bàn tay (mặc định 0.85).
+            Tỷ lệ tối đa của 1 đốt xương đơn lẻ so với lòng bàn tay.
         min_phalanx_ratio : float
-            Tỷ lệ tối thiểu giữa đốt gần và đốt giữa (mặc định 0.35).
+            Tỷ lệ tối thiểu giữa đốt gần và đốt giữa.
         max_phalanx_ratio : float
-            Tỷ lệ tối đa giữa đốt gần và đốt giữa (mặc định 3.50).
+            Tỷ lệ tối đa giữa đốt gần và đốt giữa.
         min_palm_size : float
             Kích thước lòng bàn tay tối thiểu chấp nhận được tính theo pixel (mặc định 10.0).
         """
-        self.enabled = bool(enabled)
-        self.max_finger_palm_ratio = float(max_finger_palm_ratio)
-        self.max_segment_palm_ratio = float(max_segment_palm_ratio)
-        self.min_phalanx_ratio = float(min_phalanx_ratio)
-        self.max_phalanx_ratio = float(max_phalanx_ratio)
+        import config
+        self.enabled = bool(getattr(config, "ANATOMICAL_GUARD_ENABLED", False)) if enabled is None else bool(enabled)
+        self.max_finger_palm_ratio = float(getattr(config, "MAX_FINGER_PALM_RATIO", 1.60)) if max_finger_palm_ratio is None else float(max_finger_palm_ratio)
+        self.max_segment_palm_ratio = float(getattr(config, "MAX_SEGMENT_PALM_RATIO", 1.10)) if max_segment_palm_ratio is None else float(max_segment_palm_ratio)
+        self.min_phalanx_ratio = float(getattr(config, "MIN_PHALANX_RATIO", 0.15)) if min_phalanx_ratio is None else float(min_phalanx_ratio)
+        self.max_phalanx_ratio = float(getattr(config, "MAX_PHALANX_RATIO", 6.00)) if max_phalanx_ratio is None else float(max_phalanx_ratio)
         self.min_palm_size = float(min_palm_size)
 
         # Định nghĩa các chỉ số landmark của từng ngón tay
@@ -168,28 +169,29 @@ class AnatomicalGuard:
         if np.max(pts) <= 1.05 and min_size >= 1.0:
             min_size = 0.02  # Normalized coordinate threshold
 
-        if knuckle_width < min_size * 0.40:
-            return False, f"Knuckle span too small ({knuckle_width:.2f} < {min_size * 0.40:.2f})"
+        if knuckle_width < min_size * 0.15:
+            return False, f"Knuckle span too small ({knuckle_width:.2f} < {min_size * 0.15:.2f})"
 
         # 1a. Tỷ lệ khuôn lòng bàn tay (Palm Aspect Ratio = Chiều dài / Chiều rộng)
-        # Bàn tay người có tỷ lệ xấp xỉ 0.8 - 1.5. Khi cổ tay bị kéo dãn lên vai/ngực,
-        # tỷ lệ này tăng vọt (> 2.20). Khi bàn tay bị bẹp méo, tỷ lệ tụt dốc (< 0.35).
+        # Bàn tay người có tỷ lệ xấp xỉ 0.8 - 1.5 khi mở phẳng. Khi tay nghiêng góc (perspective tilt),
+        # knuckle_width co lại trong 2D khiến tỷ lệ đạt 2.5 - 3.5. Chỉ chặn khi tỷ lệ biến dạng
+        # cực đoan (> 4.50) do cổ tay bị kéo dãn tít lên vai/ngực.
         palm_aspect_ratio = length_wrist_middle / max(knuckle_width, 1e-6)
-        if palm_aspect_ratio > 2.20:
+        if palm_aspect_ratio > 4.50:
             return False, (
-                f"Palm aspect ratio {palm_aspect_ratio:.2f} exceeds 2.20 "
+                f"Palm aspect ratio {palm_aspect_ratio:.2f} exceeds 4.50 "
                 f"(Wrist or MCP hallucination stretching to shoulder/body)"
             )
-        if palm_aspect_ratio < 0.35:
-            return False, f"Palm aspect ratio {palm_aspect_ratio:.2f} below minimum 0.35"
+        if palm_aspect_ratio < 0.15:
+            return False, f"Palm aspect ratio {palm_aspect_ratio:.2f} below minimum 0.15"
 
         # 1b. Tỷ lệ chiều dài xương ngón giữa so với lòng bàn tay
-        # Tổng độ dài 3 đốt ngón giữa không thể nhỏ hơn 48% chiều dài lòng bàn tay
+        # Cho phép các tư thế gập ngón (Fist, chữ L, chữ V) mà không bị drop nhầm
         total_middle_len = dist(9, 10) + dist(10, 11) + dist(11, 12)
-        if total_middle_len / max(length_wrist_middle, 1e-6) < 0.48:
+        if total_middle_len / max(length_wrist_middle, 1e-6) < 0.18:
             return False, (
                 f"Middle finger bone to palm ratio {total_middle_len / length_wrist_middle:.2f} "
-                f"below 0.48 (Anomalous palm elongation)"
+                f"below 0.18 (Anomalous palm elongation)"
             )
 
         # 1c. Kích thước lòng bàn tay chuẩn hóa bất biến (Invariant Palm Size)
@@ -269,17 +271,17 @@ class AnatomicalGuard:
 
         # ── 6. Kiểm tra khoảng cách cổ tay tới các khớp gốc (MCP) ─────────────
         min_wrist_mcp = min(dist(0, mcp_id) for mcp_id in [5, 9, 13, 17])
-        if (min_wrist_mcp / max(knuckle_width, 1e-6)) > 2.00:
+        if (min_wrist_mcp / max(knuckle_width, 1e-6)) > 4.50:
             return False, (
-                f"Wrist detached from knuckle span (ratio {min_wrist_mcp / knuckle_width:.2f} > 2.00)"
+                f"Wrist detached from knuckle span (ratio {min_wrist_mcp / knuckle_width:.2f} > 4.50)"
             )
 
         for mcp_id in [1, 5, 9, 13, 17]:
             d_wrist_mcp = dist(0, mcp_id)
-            if (d_wrist_mcp / palm_size) > 1.35:
+            if (d_wrist_mcp / palm_size) > 2.20:
                 return False, (
                     f"Wrist to MCP({mcp_id}) distance ratio {d_wrist_mcp / palm_size:.2f} "
-                    f"exceeds palm boundary limit 1.35"
+                    f"exceeds palm boundary limit 2.20"
                 )
 
         return True, "Valid anatomical hand"

@@ -138,11 +138,11 @@ def main():
     )
 
     anatomical_guard = AnatomicalGuard(
-        enabled=getattr(config, "ANATOMICAL_GUARD_ENABLED", True),
-        max_finger_palm_ratio=getattr(config, "MAX_FINGER_PALM_RATIO", 1.25),
-        max_segment_palm_ratio=getattr(config, "MAX_SEGMENT_PALM_RATIO", 0.85),
-        min_phalanx_ratio=getattr(config, "MIN_PHALANX_RATIO", 0.35),
-        max_phalanx_ratio=getattr(config, "MAX_PHALANX_RATIO", 3.50),
+        enabled=getattr(config, "ANATOMICAL_GUARD_ENABLED", False),
+        max_finger_palm_ratio=getattr(config, "MAX_FINGER_PALM_RATIO", 1.60),
+        max_segment_palm_ratio=getattr(config, "MAX_SEGMENT_PALM_RATIO", 1.10),
+        min_phalanx_ratio=getattr(config, "MIN_PHALANX_RATIO", 0.15),
+        max_phalanx_ratio=getattr(config, "MAX_PHALANX_RATIO", 6.00),
     )
 
     mouse_controller = MouseController(
@@ -284,16 +284,17 @@ def main():
                         raw_pts = [(i, l.x * w, l.y * h, l.z * w) for i, l in enumerate(hand_lms.landmark)]
 
                         # Bộ lọc giải phẫu học sinh học (Anatomical Sanity Guard)
-                        is_anatomical_valid, guard_reason = anatomical_guard.validate_hand(raw_pts)
-                        if not is_anatomical_valid:
-                            # Chặn đứng 100% hiện tượng kéo dãn xương lên vai/mặt
-                            cv2.putText(enhanced, f"CHAN DI DANG: {guard_reason}", (15, h - 70),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
-                            smoothed_pts, is_valid = kalman_hands[h_idx].update(None)
-                            if is_valid:
-                                hands_data.append(smoothed_pts)
-                                velocities.append(kalman_hands[h_idx].get_hand_velocity())
-                            continue
+                        if anatomical_guard.enabled:
+                            is_anatomical_valid, guard_reason = anatomical_guard.validate_hand(raw_pts)
+                            if not is_anatomical_valid:
+                                # Chặn hiện tượng kéo dãn xương lên vai/mặt
+                                cv2.putText(enhanced, f"CHAN DI DANG: {guard_reason}", (15, h - 70),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
+                                smoothed_pts, is_valid = kalman_hands[h_idx].update(None)
+                                if is_valid:
+                                    hands_data.append(smoothed_pts)
+                                    velocities.append(kalman_hands[h_idx].get_hand_velocity())
+                                continue
 
                         mp_drawing.draw_landmarks(enhanced, hand_lms, mp_hands.HAND_CONNECTIONS)
 
